@@ -1,0 +1,39 @@
+name: altTab
+options:
+  bundleIdPrefix: com.yourcompany
+  deploymentTarget:
+    macOS: "13.0"
+  xcodeVersion: "16.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    MACOSX_DEPLOYMENT_TARGET: "13.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    GENERATE_INFOPLIST_FILE: NO
+    INFOPLIST_FILE: Resources/Info.plist
+    CODE_SIGN_STYLE: Automatic
+    DEVELOPMENT_TEAM: ""
+    PRODUCT_NAME: altTab
+
+targets:
+  altTab:
+    type: application
+    platform: macOS
+    sources:
+      - Sources/
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.yourcompany.alttab
+        INFOPLIST_FILE: Resources/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Resources/altTab.entitlements
+        ENABLE_HARDENED_RUNTIME: YES
+        TARGETED_DEVICE_FAMILY: "1"
+        GENERATE_INFOPLIST_FILE: NO
+    entitlements:
+      path: Resources/altTab.entitlements
+      merge: false
+    dependencies: []
+    preBuildScripts: []
+    postBuildScripts: []
