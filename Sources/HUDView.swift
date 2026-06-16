@@ -130,7 +130,7 @@ struct HUDView: View {
         let xStep = centeredWidth * 0.35
         let yStep = min(size.height * 0.035, 0)
 
-        switch offset {
+        switch offset {			
         case 0:
             return .zero
         case 1:
