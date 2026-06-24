@@ -95,8 +95,13 @@ final class HUDController: NSObject {
 
     private func showWithWindows(_ windows: [WindowManager.WindowInfo]) {
         currentWindowIDs = windows.map(\.id)
+        activeWindows = windows
         presentPanel(with: windows)
         isVisible = true
+        print("[HUDController] showWithWindows: \(windows.count) windows loaded")
+        for (i, w) in windows.enumerated() {
+            print("[HUDController]   [\(i)] ID=\(w.id) pid=\(w.appPID) title=\"\(w.title ?? "")\" frame=\(w.frame)")
+        }
     }
 
     func handleOptionRelease() {
@@ -105,12 +110,23 @@ final class HUDController: NSObject {
     }
 
     private func activateAndHide() {
-        guard isVisible, let hostingView else { return }
-        let windows = hostingView.rootView.windows
+        guard isVisible else {
+            print("[HUDController] activateAndHide: not visible, abort")
+            return
+        }
+
         let idx = state.selectedIndex
-        guard idx < windows.count else { return hide() }
+        let windows = activeWindows
+
+        print("[HUDController] activateAndHide: idx=\(idx) windows.count=\(windows.count)")
+        guard idx < windows.count else {
+            print("[HUDController] activateAndHide: idx \(idx) out of bounds, hiding")
+            hide()
+            return
+        }
 
         let target = windows[idx]
+        print("[HUDController] activateAndHide: → idx=\(idx) ID=\(target.id) pid=\(target.appPID) title=\"\(target.title ?? "")\"")
         recordRecentWindow(target.id)
         Task { await windowManager.activateWindow(target) }
         hide()
@@ -223,4 +239,8 @@ final class HUDController: NSObject {
     }
 
     private var currentWindowIDs: [CGWindowID] = []
+
+    /// Stored reference to the windows currently displayed in the HUD.
+    /// Used instead of `hostingView.rootView.windows` for reliable access during activation.
+    private var activeWindows: [WindowManager.WindowInfo] = []
 }

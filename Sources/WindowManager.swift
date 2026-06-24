@@ -161,49 +161,212 @@ actor WindowManager {
     }
 
     func activateWindow(_ info: WindowInfo) {
-        guard let app = NSRunningApplication(processIdentifier: info.appPID) else { return }
-        app.activate(options: [.activateIgnoringOtherApps])
+        print("[WindowManager] activateWindow: \"\(info.appName)\" windowID=\(info.id) title=\"\(info.title ?? "")\"")
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-            Self.focusAXWindow(pid: info.appPID, windowID: info.id, frame: info.frame)
+        // AXUIElement APIs and app activation must run on the main thread.
+        // Since WindowManager is an actor, we dispatch to main explicitly.
+        let pid = info.appPID
+        let windowID = info.id
+        let frame = info.frame
+        let title = info.title
+        let appName = info.appName
+
+        DispatchQueue.main.async {
+            guard let app = NSRunningApplication(processIdentifier: pid) else {
+                print("[WindowManager] ❌ No NSRunningApplication for PID \(pid)")
+                return
+            }
+
+            print("[WindowManager]   frame=\(frame)")
+
+            // Step 1: Raise the target window via AX BEFORE activating the app.
+            // This ensures the target window is on top within the app's Z-order,
+            // so the subsequent app.activate() brings the right window to front.
+            Self.raiseAXWindow(pid: pid, windowID: windowID, frame: frame, title: title, appName: appName)
+
+            // Step 2: Activate the app (brings it to front)
+            app.activate(options: [.activateIgnoringOtherApps])
+
+            // Step 3: Retry raising after activation (in case the app reordered windows)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                Self.raiseAXWindow(pid: pid, windowID: windowID, frame: frame, title: title, appName: appName)
+            }
         }
     }
 
-    private static func focusAXWindow(pid: pid_t, windowID: CGWindowID, frame: CGRect) {
+    /// Attempts to raise and focus a specific AX window using multiple matching strategies.
+    /// - Tries AXWindowNumber first (exact match).
+    /// - Falls back to frame comparison with tolerance (handles Electron/VS Code differences).
+    /// - Falls back to title comparison (partial match).
+    /// - Falls back to AppleScript for problematic apps (Electron/VS Code).
+    private static func raiseAXWindow(pid: pid_t, windowID: CGWindowID, frame: CGRect, title: String?, appName: String) {
         let appElement = AXUIElementCreateApplication(pid)
-        var value: CFTypeRef?
-        AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &value)
-        guard let axWindows = value as? [AXUIElement] else { return }
 
-        for axWindow in axWindows {
+        // ── Debug: dump all AX windows ──
+        var windowsValue: CFTypeRef?
+        let windowsResult = AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowsValue)
+        guard windowsResult == .success, let axWindows = windowsValue as? [AXUIElement] else {
+            print("[WindowManager] ⚠️ raiseAXWindow: No AX windows for pid \(pid) (error=\(windowsResult.rawValue))")
+
+            // Fallback: try AppleScript for apps where AX doesn't list windows
+            Self.activateViaAppleScript(appName: appName, title: title)
+            return
+        }
+
+        print("[WindowManager] raiseAXWindow: target ID=\(windowID) AX has \(axWindows.count) windows")
+
+        for (i, axWindow) in axWindows.enumerated() {
+            // ── Strategy 1: Match by AXWindowNumber (exact) ──
             var windowNumberValue: CFTypeRef?
-            AXUIElementCopyAttributeValue(axWindow, "AXWindowNumber" as CFString, &windowNumberValue)
-            if let windowNumberValue = windowNumberValue as? NSNumber,
-               CGWindowID(windowNumberValue.intValue) == windowID {
-                    AXUIElementPerformAction(axWindow, kAXRaiseAction as CFString)
-                    AXUIElementSetAttributeValue(axWindow, kAXFocusedAttribute as CFString, kCFBooleanTrue)
-                    break
+            let numResult = AXUIElementCopyAttributeValue(axWindow, "AXWindowNumber" as CFString, &windowNumberValue)
+
+            if numResult == .success, let windowNumberValue = windowNumberValue as? NSNumber {
+                let axWindowID = CGWindowID(windowNumberValue.intValue)
+                if axWindowID == windowID {
+                    print("[WindowManager] ✅ Window[\(i)] matched by ID: \(axWindowID)")
+                    Self.raiseAndFocus(axWindow)
+                    return
+                } else {
+                    // AXWindowNumber available but doesn't match → skip
+                    continue
+                }
             }
 
+            // ── Debug: log AX window info ──
+            var debugTitle: CFTypeRef?
+            AXUIElementCopyAttributeValue(axWindow, kAXTitleAttribute as CFString, &debugTitle)
+            let axTitle = debugTitle as? String ?? "<nil>"
+
+            // ── Strategy 2: Match by title (partial match) ──
+            // This is more reliable for Electron apps where frame may differ
+            if let targetTitle = title, !targetTitle.isEmpty {
+                if let axTitleStr = debugTitle as? String, !axTitleStr.isEmpty {
+                    // Check if titles match (case-insensitive)
+                    if axTitleStr.caseInsensitiveCompare(targetTitle) == .orderedSame ||
+                       targetTitle.caseInsensitiveCompare(axTitleStr) == .orderedSame {
+                        print("[WindowManager] ✅ Window[\(i)] matched by title: \"\(axTitleStr)\"")
+                        Self.raiseAndFocus(axWindow)
+                        return
+                    }
+
+                    // For Electron apps, check if the titles share a common substring
+                    // (e.g., "project — Visual Studio Code" contains the project name)
+                    if axTitleStr.contains("Visual Studio Code") && targetTitle.contains("Visual Studio Code") {
+                        print("[WindowManager]   Window[\(i)] title=\"\(axTitleStr)\" is also VS Code, trying frame match...")
+                        // fall through to frame matching below
+                    } else {
+                        print("[WindowManager]   Window[\(i)] title=\"\(axTitleStr)\" ≠ \"\(targetTitle)\"")
+                        continue
+                    }
+                }
+            }
+
+            // ── Strategy 3: Match by frame (with tolerance) ──
             var pos: CFTypeRef?
-            AXUIElementCopyAttributeValue(axWindow, kAXPositionAttribute as CFString, &pos)
-            guard let posVal = pos else { continue }
+            guard AXUIElementCopyAttributeValue(axWindow, kAXPositionAttribute as CFString, &pos) == .success,
+                  let posVal = pos else { print("[WindowManager]   Window[\(i)]: no position"); continue }
             var point = CGPoint.zero
-            AXValueGetValue(posVal as! AXValue, .cgPoint, &point)
+            guard AXValueGetValue(posVal as! AXValue, .cgPoint, &point) else { continue }
 
             var sz: CFTypeRef?
-            AXUIElementCopyAttributeValue(axWindow, kAXSizeAttribute as CFString, &sz)
-            guard let szVal = sz else { continue }
+            guard AXUIElementCopyAttributeValue(axWindow, kAXSizeAttribute as CFString, &sz) == .success,
+                  let szVal = sz else { print("[WindowManager]   Window[\(i)]: no size"); continue }
             var size = CGSize.zero
-            AXValueGetValue(szVal as! AXValue, .cgSize, &size)
+            guard AXValueGetValue(szVal as! AXValue, .cgSize, &size) else { continue }
 
             let axFrame = CGRect(origin: point, size: size)
-            if axFrame.equalTo(frame) {
-                AXUIElementPerformAction(axWindow, kAXRaiseAction as CFString)
-                AXUIElementSetAttributeValue(axWindow, kAXFocusedAttribute as CFString, kCFBooleanTrue)
-                break
+
+            let tolerance: CGFloat = 20.0
+            let frameMatch = abs(axFrame.origin.x - frame.origin.x) < tolerance
+                          && abs(axFrame.origin.y - frame.origin.y) < tolerance
+                          && abs(axFrame.width - frame.width) < tolerance
+                          && abs(axFrame.height - frame.height) < tolerance
+
+            if frameMatch {
+                print("[WindowManager] ✅ Window[\(i)] matched by frame (tol=\(tolerance)): ax=\(axFrame)")
+                Self.raiseAndFocus(axWindow)
+                return
             }
+
+            print("[WindowManager]   Window[\(i)]: title=\"\(axTitle)\" frame=\(axFrame) → no match")
         }
+
+        print("[WindowManager] ⚠️ AX matching failed for ID=\(windowID), trying AppleScript fallback...")
+        Self.activateViaAppleScript(appName: appName, title: title)
+    }
+
+    /// Fallback: use AppleScript to focus a window by title.
+    /// Works reliably for apps that don't properly expose AX attributes (Electron, etc.)
+    private static func activateViaAppleScript(appName: String, title: String?) {
+        guard let title, !title.isEmpty else {
+            print("[WindowManager] ⚠️ activateViaAppleScript: no title provided")
+            return
+        }
+
+        // Find the app by name to get its bundle identifier
+        let bundleID = NSWorkspace.shared.runningApplications
+            .first(where: { $0.localizedName?.caseInsensitiveCompare(appName) == .orderedSame || $0.localizedName?.caseInsensitiveCompare(appName) == .orderedSame })?
+            .bundleIdentifier
+
+        guard let bundleID, !bundleID.isEmpty else {
+            print("[WindowManager] ⚠️ activateViaAppleScript: no bundle ID found for \"\(appName)\"")
+            // Fallback: try using the app name directly
+            Self.runAppleScript(appName: appName, title: title)
+            return
+        }
+
+        print("[WindowManager] activateViaAppleScript: bundleID=\(bundleID) title=\"\(title)\"")
+        Self.runAppleScript(bundleID: bundleID, title: title)
+    }
+
+    private static func runAppleScript(bundleID: String, title: String) {
+        let escapedTitle = title.replacingOccurrences(of: "\"", with: "\\\"")
+        let script = """
+        tell application id "\(bundleID)"
+            activate
+            set targetWindow to first window whose title contains "\(escapedTitle)"
+            if targetWindow is not missing value then
+                set index of targetWindow to 1
+            end if
+        end tell
+        """
+        Self.executeAppleScript(script, title: title)
+    }
+
+    private static func runAppleScript(appName: String, title: String) {
+        let escapedTitle = title.replacingOccurrences(of: "\"", with: "\\\"")
+        let escapedAppName = appName.replacingOccurrences(of: "\"", with: "\\\"")
+        let script = """
+        tell application "\(escapedAppName)"
+            activate
+            set targetWindow to first window whose title contains "\(escapedTitle)"
+            if targetWindow is not missing value then
+                set index of targetWindow to 1
+            end if
+        end tell
+        """
+        Self.executeAppleScript(script, title: title)
+    }
+
+    private static func executeAppleScript(_ script: String, title: String) {
+        var error: NSDictionary?
+        if let appleScript = NSAppleScript(source: script) {
+            let result = appleScript.executeAndReturnError(&error)
+            if let error {
+                print("[WindowManager] ⚠️ AppleScript error: \(error)")
+            } else if let resultStr = result.stringValue {
+                print("[WindowManager] ✅ AppleScript result: \(resultStr)")
+            } else {
+                print("[WindowManager] ✅ AppleScript executed for \"\(title)\"")
+            }
+        } else {
+            print("[WindowManager] ⚠️ AppleScript compilation failed")
+        }
+    }
+
+    private static func raiseAndFocus(_ axWindow: AXUIElement) {
+        AXUIElementPerformAction(axWindow, kAXRaiseAction as CFString)
+        AXUIElementSetAttributeValue(axWindow, kAXFocusedAttribute as CFString, kCFBooleanTrue)
     }
 
     func clearCache() {

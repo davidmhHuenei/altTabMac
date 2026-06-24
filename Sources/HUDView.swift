@@ -142,7 +142,7 @@ struct HUDView: View {
         case -2:
             return CGSize(width: -xStep * 2, height: yStep * 2)
         default:
-            return .zero
+            return .zero		
         }
     }
 
